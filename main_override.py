@@ -9,10 +9,10 @@ import json
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from jose import JWTError, jwt
@@ -55,9 +55,15 @@ def init_db():
             created_at TEXT NOT NULL,
             onboarding_flags TEXT,
             questionnaire_data TEXT,
-            tone_data TEXT
+            tone_data TEXT,
+            onboarding_data TEXT
         )
     """)
+    # Add onboarding_data column if it doesn't exist (migration)
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN onboarding_data TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -123,6 +129,27 @@ def verify_token(token: str) -> str:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+def get_current_user(authorization: Optional[str] = Header(None)) -> str:
+    """Extract user_id from Authorization header"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing authorization")
+    token = authorization.split(" ", 1)[1]
+    return verify_token(token)
+
+def get_user_onboarding(user_id: str) -> Optional[Dict[str, Any]]:
+    """Get user's onboarding data if it exists"""
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT onboarding_data FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    db.close()
+    if row and row["onboarding_data"]:
+        try:
+            return json.loads(row["onboarding_data"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
 # ============================================================================
 # Pydantic Models
 # ============================================================================
@@ -157,7 +184,7 @@ class ChatRequest(BaseModel):
 # App Setup
 # ============================================================================
 
-app = FastAPI(title="Plinth Backend", version="1.0.0")
+app = FastAPI(title="Plinth Backend", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -228,6 +255,35 @@ def login(req: AuthRequest) -> AuthResponse:
         data=tokens,
     )
 
+@app.get("/api/v2/auth/me")
+def get_me(user_id: str = Depends(get_current_user)):
+    """Get current user info including onboarding status"""
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT user_id, email, created_at, onboarding_data FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    db.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    onboarding_data = None
+    onboarding_completed = False
+    if row["onboarding_data"]:
+        try:
+            onboarding_data = json.loads(row["onboarding_data"])
+            onboarding_completed = True
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return {
+        "user_id": row["user_id"],
+        "email": row["email"],
+        "created_at": row["created_at"],
+        "onboarding_completed": onboarding_completed,
+        "onboarding_data": onboarding_data,
+    }
+
 @app.post("/api/v2/auth/refresh")
 def refresh_token(req: RefreshTokenRequest) -> AuthResponse:
     """Refresh access token"""
@@ -239,344 +295,28 @@ def refresh_token(req: RefreshTokenRequest) -> AuthResponse:
     )
 
 # ============================================================================
-# Session & Hub Endpoints
-# ============================================================================
-
-@app.get("/api/session")
-def get_session() -> SessionResponse:
-    """Get session data with onboarding flags"""
-    return SessionResponse(
-        ok=True,
-        data={
-            "user_id": str(uuid4()),
-            "email": "user@example.com",
-            "onboarding_flags": {
-                "completed_questionnaire": False,
-                "selected_tone": False,
-                "reviewed_brief": False,
-            },
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-
-@app.get("/api/hub/today")
-def get_hub_today() -> DataEnvelopeResponse:
-    """Get today's hub data"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "date": datetime.now(timezone.utc).date().isoformat(),
-            "brief": {
-                "topic": "AI Regulation in Tech",
-                "angle": "Executive Perspective",
-                "hook": "New EU AI Act enforcement signals market shift",
-                "supporting_claims": [
-                    "EU fines tech companies $1B+ for compliance violations",
-                    "Fortune 500 increasing AI governance investment",
-                    "Enterprise adoption accelerating despite regulatory concerns",
-                ],
-                "rationale": "Regulatory landscape is tightening, creating urgency for compliance",
-            },
-            "strategy_snapshot": {
-                "positioning": "Thought Leader in Responsible AI",
-                "recommended_focus": ["Governance", "Compliance", "Ethics"],
-                "active_signals": ["EU Action", "Enterprise Demand", "Safety Focus"],
-                "territory_coverage": 65,
-            },
-            "memory_state": {
-                "total_territories": 12,
-                "active_claims": 18,
-                "reinforcement_count": 42,
-            },
-            "engagement_summary": {
-                "messages_today": 5,
-                "conversations_active": 2,
-                "voice_consistency": 94,
-            },
-        },
-    )
-
-@app.get("/api/hub/brief")
-def get_brief() -> DataEnvelopeResponse:
-    """Get brief data"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "topic": "AI Regulation in Tech",
-            "subtopic": "Enterprise Compliance Strategies",
-            "angle": "Executive Perspective",
-            "hook": "New EU AI Act enforcement signals market shift for enterprise tech leaders",
-            "supporting_claims": [
-                "EU fines tech companies $1B+ for compliance violations in 2024",
-                "Fortune 500 companies increasing AI governance budgets by 150%",
-                "Enterprise adoption rates up 40% despite regulatory concerns",
-                "Compliance becomes competitive advantage in B2B sales",
-                "In-house AI governance teams now standard at major firms",
-            ],
-            "rationale": "Enterprise leaders need pragmatic compliance strategies to capitalize on regulatory clarity",
-            "key_messages": [
-                "Regulation creates opportunities for compliant innovators",
-                "Early movers gain competitive advantage in enterprise markets",
-                "Governance maturity is now a boardroom priority",
-            ],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
-        },
-    )
-
-# ============================================================================
-# Memory Endpoints
-# ============================================================================
-
-@app.get("/api/v2/memory/state")
-def get_memory_state() -> DataEnvelopeResponse:
-    """Get memory state"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "territories": [
-                {
-                    "id": "t1",
-                    "name": "AI Governance",
-                    "claims_count": 8,
-                    "reinforcement_score": 92,
-                },
-                {
-                    "id": "t2",
-                    "name": "Enterprise Risk Management",
-                    "claims_count": 5,
-                    "reinforcement_score": 78,
-                },
-                {
-                    "id": "t3",
-                    "name": "Regulatory Compliance",
-                    "claims_count": 5,
-                    "reinforcement_score": 85,
-                },
-            ],
-            "total_territories": 3,
-            "total_claims": 18,
-            "total_reinforcements": 127,
-        },
-    )
-
-@app.get("/api/v2/memory/reinforcement/counts")
-def get_reinforcement_counts() -> DataEnvelopeResponse:
-    """Get reinforcement counts"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "weekly": 32,
-            "monthly": 127,
-            "all_time": 342,
-            "by_territory": {
-                "AI Governance": 48,
-                "Enterprise Risk Management": 31,
-                "Regulatory Compliance": 48,
-            },
-        },
-    )
-
-@app.get("/api/v2/memory/territory/coverage")
-def get_territory_coverage() -> DataEnvelopeResponse:
-    """Get territory coverage"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "coverage_percentage": 65,
-            "territories": [
-                {
-                    "name": "AI Governance",
-                    "coverage": 87,
-                    "last_reinforced": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
-                },
-                {
-                    "name": "Enterprise Risk Management",
-                    "coverage": 72,
-                    "last_reinforced": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
-                },
-                {
-                    "name": "Regulatory Compliance",
-                    "coverage": 66,
-                    "last_reinforced": (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat(),
-                },
-            ],
-        },
-    )
-
-# ============================================================================
-# Strategy Endpoints
-# ============================================================================
-
-@app.get("/api/v2/strategy")
-def get_strategy() -> DataEnvelopeResponse:
-    """Get strategy data"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "positioning": "Thought Leader in Responsible AI Implementation",
-            "target_audience": "Enterprise CTOs and AI Governance Leaders",
-            "recommended_focus": [
-                "Governance Frameworks",
-                "Risk Mitigation",
-                "Compliance Automation",
-            ],
-            "active_signals": [
-                "EU AI Act Enforcement",
-                "Enterprise Demand for Governance",
-                "Board-Level Scrutiny of AI",
-                "Insurance Market Growth for AI Risk",
-            ],
-            "territory_allocation": {
-                "AI Governance": 40,
-                "Enterprise Risk Management": 35,
-                "Regulatory Compliance": 25,
-            },
-            "messaging_pillars": [
-                "Regulation creates competitive advantage for prepared leaders",
-                "Governance maturity is a boardroom priority",
-                "Proactive compliance beats reactive firefighting",
-            ],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-
-# ============================================================================
-# Chat Endpoints
-# ============================================================================
-
-@app.post("/api/v2/chat/context")
-def get_chat_context(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
-    """Get chat context"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "current_brief": {
-                "topic": "AI Regulation in Tech",
-                "angle": "Executive Perspective",
-            },
-            "recent_territories": [
-                "AI Governance",
-                "Enterprise Risk Management",
-            ],
-            "message_history_count": 12,
-            "conversation_context": "Discussing enterprise AI governance strategies",
-        },
-    )
-
-@app.post("/api/coach/chat")
-def coach_chat(req: ChatRequest) -> DataEnvelopeResponse:
-    """Chat with coach"""
-    message = req.message.lower()
-
-    # Simple intent routing
-    if "brief" in message:
-        response_text = "Your current brief focuses on AI governance in enterprise. Would you like to explore specific angles or supporting claims?"
-    elif "memory" in message or "reinforce" in message:
-        response_text = "You've reinforced AI Governance 48 times this month. Your memory coverage is at 65%. Consider deepening your claim library in Enterprise Risk Management."
-    elif "strategy" in message:
-        response_text = "Your positioning as a thought leader in responsible AI is strong. Focus on the compliance-as-advantage angle—enterprise CTOs are increasingly receptive."
-    elif "voice" in message or "tone" in message:
-        response_text = "Your voice consistency is at 94%. Maintain your authoritative yet approachable tone when discussing governance frameworks."
-    else:
-        response_text = "I'm here to help you strengthen your positioning. What aspect of your brand intelligence would you like to explore—your brief, memory territories, strategy, or voice?"
-
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "message": response_text,
-            "suggestions": [
-                "Review your brief",
-                "Check memory coverage",
-                "Refine strategy focus",
-            ],
-            "context": req.context or {},
-        },
-    )
-
-# ============================================================================
-# Voice Endpoints
-# ============================================================================
-
-@app.get("/api/v2/voice/profile")
-def get_voice_profile() -> DataEnvelopeResponse:
-    """Get voice profile"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "tone_markers": [
-                "Authoritative",
-                "Pragmatic",
-                "Insightful",
-                "Professional",
-                "Accessible",
-            ],
-            "boundaries": [
-                "Avoid speculation",
-                "Ground claims in evidence",
-                "Balance optimism with realism",
-                "Respect regulatory complexity",
-            ],
-            "examples": [
-                "Enterprise AI governance is no longer optional—it's a competitive advantage.",
-                "The regulation creates clarity. Smart organizations are moving faster, not slower.",
-            ],
-            "consistency_score": 94,
-            "consistency_trend": "improving",
-            "last_updated": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),
-        },
-    )
-
-# ============================================================================
-# Draft Endpoints
-# ============================================================================
-
-@app.post("/api/v2/drafts/generate")
-def generate_draft(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
-    """Generate a draft"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "draft_id": str(uuid4()),
-            "type": "article",
-            "title": "Why Enterprise Leaders Are Embracing AI Governance",
-            "content": """The EU AI Act is often framed as a burden, but savvy enterprise leaders see it differently.
-
-Regulation creates clarity. When rules are clear, those who move first gain advantages. Enterprise CTOs are increasingly recognizing that governance maturity isn't an obstacle to innovation—it's a prerequisite for scaling AI safely.
-
-Consider the numbers: Fortune 500 companies are increasing AI governance budgets by 150%. Board-level scrutiny of AI is at an all-time high. And here's the key insight: the companies moving fastest to implement governance frameworks are also the ones capturing the most value.
-
-The regulation isn't slowing innovation. It's accelerating the separation between leaders and laggards.
-
-For enterprise organizations, the play is clear: build governance maturity now, and you'll have a two-year head start on competitors who delay.""",
-            "brief_reference": "AI Regulation in Tech",
-            "territories_covered": ["AI Governance", "Enterprise Risk Management"],
-            "tone_alignment": 96,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-
-@app.post("/api/v2/drafts/validate")
-def validate_draft(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
-    """Validate a draft"""
-    return DataEnvelopeResponse(
-        ok=True,
-        data={
-            "is_valid": True,
-            "tone_alignment_score": 94,
-            "brief_alignment_score": 92,
-            "territory_coverage_score": 88,
-            "issues": [],
-            "suggestions": [
-                "Consider adding more specific enterprise examples",
-                "Strong voice consistency throughout",
-            ],
-        },
-    )
-
-# ============================================================================
 # Onboarding Endpoints
 # ============================================================================
+
+@app.post("/api/v2/onboarding/complete")
+def complete_onboarding(data: Optional[Dict[str, Any]] = None, user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Save onboarding calibration data"""
+    if not data:
+        raise HTTPException(status_code=400, detail="No calibration data provided")
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        "UPDATE users SET onboarding_data = ?, onboarding_flags = ? WHERE user_id = ?",
+        (json.dumps(data), json.dumps({"completed_questionnaire": True, "selected_tone": True, "reviewed_brief": False}), user_id)
+    )
+    db.commit()
+    db.close()
+
+    return DataEnvelopeResponse(
+        ok=True,
+        data={"saved": True, "onboarding_completed": True},
+    )
 
 @app.post("/api/v2/onboarding/questionnaire")
 def save_questionnaire(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
@@ -600,6 +340,394 @@ def save_tone(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
             "saved": True,
             "tone_markers": data.get("tone_markers", []) if data else [],
             "boundaries": data.get("boundaries", []) if data else [],
+        },
+    )
+
+# ============================================================================
+# Session & Hub Endpoints (Personalized)
+# ============================================================================
+
+@app.get("/api/session")
+def get_session() -> SessionResponse:
+    """Get session data"""
+    return SessionResponse(
+        ok=True,
+        data={
+            "user_id": str(uuid4()),
+            "email": "user@example.com",
+            "onboarding_flags": {
+                "completed_questionnaire": False,
+                "selected_tone": False,
+                "reviewed_brief": False,
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+@app.get("/api/hub/today")
+def get_hub_today(user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Get today's hub data — personalized if onboarding is complete"""
+    ob = get_user_onboarding(user_id)
+
+    if ob:
+        positioning = ob.get("positioning_target", "your expertise")
+        topics = ob.get("content_territories", ob.get("core_ideas", []))
+        audience = ob.get("audience_description", "your audience")
+        first_topic = topics[0] if topics else "your core topic"
+        second_topic = topics[1] if len(topics) > 1 else "your expertise"
+        return DataEnvelopeResponse(
+            ok=True,
+            data={
+                "date": datetime.now(timezone.utc).date().isoformat(),
+                "personalized": True,
+                "brief": {
+                    "topic": first_topic,
+                    "angle": f"Reinforce your positioning in {positioning}",
+                    "hook": f"Share your perspective on {first_topic} — your audience needs this from you today",
+                    "supporting_claims": ob.get("core_ideas", [])[:3],
+                    "rationale": f"This reinforces your authority in {positioning} for {audience}",
+                },
+                "strategy_snapshot": {
+                    "positioning": positioning,
+                    "recommended_focus": topics[:3] if topics else ["Define your territories"],
+                    "active_signals": [f"Reinforce {t}" for t in (topics[:2] if topics else ["your positioning"])],
+                    "territory_coverage": min(len(topics) * 15, 100) if topics else 0,
+                },
+                "memory_state": {
+                    "total_territories": len(topics) if topics else 0,
+                    "active_claims": len(ob.get("core_ideas", [])),
+                    "reinforcement_count": 0,
+                },
+                "engagement_summary": {
+                    "messages_today": 0,
+                    "conversations_active": 0,
+                    "voice_consistency": 0,
+                },
+            },
+        )
+
+    # Default for users who haven't onboarded
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "personalized": False,
+            "brief": {
+                "topic": "Complete your brand setup",
+                "angle": "Get started",
+                "hook": "Set up your brand identity to unlock personalized strategic briefs",
+                "supporting_claims": [],
+                "rationale": "Complete onboarding to receive tailored daily briefs",
+            },
+            "strategy_snapshot": {
+                "positioning": "Not yet configured",
+                "recommended_focus": ["Complete brand setup"],
+                "active_signals": [],
+                "territory_coverage": 0,
+            },
+            "memory_state": {
+                "total_territories": 0,
+                "active_claims": 0,
+                "reinforcement_count": 0,
+            },
+            "engagement_summary": {
+                "messages_today": 0,
+                "conversations_active": 0,
+                "voice_consistency": 0,
+            },
+        },
+    )
+
+@app.get("/api/hub/brief")
+def get_brief(user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Get brief data — personalized"""
+    ob = get_user_onboarding(user_id)
+
+    if ob:
+        positioning = ob.get("positioning_target", "your expertise")
+        topics = ob.get("content_territories", ob.get("core_ideas", []))
+        first_topic = topics[0] if topics else positioning
+        return DataEnvelopeResponse(
+            ok=True,
+            data={
+                "topic": first_topic,
+                "subtopic": positioning,
+                "angle": f"Strengthen your authority in {first_topic}",
+                "hook": f"Share your unique perspective on {first_topic} to reinforce your positioning",
+                "supporting_claims": ob.get("core_ideas", []),
+                "rationale": f"Publishing on {first_topic} reinforces your positioning in {positioning}",
+                "key_messages": ob.get("core_ideas", [])[:3],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
+            },
+        )
+
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "topic": "Set up your brand",
+            "subtopic": "Getting started",
+            "angle": "Complete onboarding",
+            "hook": "Configure your brand identity to unlock personalized briefs",
+            "supporting_claims": [],
+            "rationale": "Complete the brand setup to receive strategic daily briefs",
+            "key_messages": ["Complete your brand setup to get started"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
+        },
+    )
+
+# ============================================================================
+# Memory Endpoints (Personalized)
+# ============================================================================
+
+@app.get("/api/v2/memory/state")
+def get_memory_state(user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Get memory state — personalized"""
+    ob = get_user_onboarding(user_id)
+
+    if ob:
+        topics = ob.get("content_territories", ob.get("core_ideas", []))
+        territories = []
+        for i, t in enumerate(topics[:6]):
+            territories.append({
+                "id": f"t{i+1}",
+                "name": t,
+                "claims_count": 0,
+                "reinforcement_score": 0,
+            })
+        return DataEnvelopeResponse(
+            ok=True,
+            data={
+                "territories": territories,
+                "total_territories": len(territories),
+                "total_claims": len(ob.get("core_ideas", [])),
+                "total_reinforcements": 0,
+            },
+        )
+
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "territories": [],
+            "total_territories": 0,
+            "total_claims": 0,
+            "total_reinforcements": 0,
+        },
+    )
+
+@app.get("/api/v2/memory/reinforcement/counts")
+def get_reinforcement_counts(user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Get reinforcement counts"""
+    ob = get_user_onboarding(user_id)
+    by_territory = {}
+    if ob:
+        for t in ob.get("content_territories", [])[:6]:
+            by_territory[t] = 0
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "weekly": 0,
+            "monthly": 0,
+            "all_time": 0,
+            "by_territory": by_territory,
+        },
+    )
+
+@app.get("/api/v2/memory/territory/coverage")
+def get_territory_coverage(user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Get territory coverage"""
+    ob = get_user_onboarding(user_id)
+    territories = []
+    if ob:
+        for t in ob.get("content_territories", [])[:6]:
+            territories.append({
+                "name": t,
+                "coverage": 0,
+                "last_reinforced": None,
+            })
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "coverage_percentage": 0,
+            "territories": territories,
+        },
+    )
+
+# ============================================================================
+# Strategy Endpoints (Personalized)
+# ============================================================================
+
+@app.get("/api/v2/strategy")
+def get_strategy(user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Get strategy data — personalized"""
+    ob = get_user_onboarding(user_id)
+
+    if ob:
+        positioning = ob.get("positioning_target", "your expertise")
+        audience = ob.get("audience_description", "your audience")
+        topics = ob.get("content_territories", [])
+        core_ideas = ob.get("core_ideas", [])
+        return DataEnvelopeResponse(
+            ok=True,
+            data={
+                "positioning": positioning,
+                "target_audience": audience,
+                "recommended_focus": topics[:3] if topics else [],
+                "active_signals": [f"Reinforce: {c}" for c in core_ideas[:4]],
+                "territory_allocation": {t: round(100 / max(len(topics), 1)) for t in topics[:5]},
+                "messaging_pillars": core_ideas[:3],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "positioning": "Not yet configured",
+            "target_audience": "Complete brand setup",
+            "recommended_focus": [],
+            "active_signals": [],
+            "territory_allocation": {},
+            "messaging_pillars": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+# ============================================================================
+# Chat Endpoints
+# ============================================================================
+
+@app.post("/api/v2/chat/context")
+def get_chat_context(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
+    """Get chat context"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "current_brief": {"topic": "Your brand strategy", "angle": "Personalized"},
+            "recent_territories": [],
+            "message_history_count": 0,
+            "conversation_context": "Strategic coaching session",
+        },
+    )
+
+@app.post("/api/coach/chat")
+def coach_chat(req: ChatRequest, user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Chat with coach — personalized"""
+    ob = get_user_onboarding(user_id)
+    message = req.message.lower()
+
+    if ob:
+        positioning = ob.get("positioning_target", "your expertise")
+        topics = ob.get("content_territories", [])
+        core_ideas = ob.get("core_ideas", [])
+
+        if "brief" in message:
+            response_text = f"Your current focus is on reinforcing your positioning in {positioning}. Would you like to explore specific angles?"
+        elif "memory" in message or "reinforce" in message:
+            response_text = f"You have {len(topics)} territories and {len(core_ideas)} core ideas configured. Let's plan your reinforcement strategy."
+        elif "strategy" in message:
+            response_text = f"Your positioning as an authority in {positioning} is your strategic foundation. Which territory would you like to strengthen first?"
+        else:
+            topic_list = ", ".join(topics[:3]) if topics else "your key topics"
+            response_text = f"I'm here to help you build authority in {positioning}. Your territories include {topic_list}. What would you like to work on?"
+    else:
+        response_text = "Welcome to Plinth! Complete your brand setup first to unlock personalized coaching. Head to Setup to configure your brand identity."
+
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "message": response_text,
+            "suggestions": ["Review your brief", "Check memory coverage", "Refine strategy focus"],
+            "context": req.context or {},
+        },
+    )
+
+# ============================================================================
+# Voice Endpoints
+# ============================================================================
+
+@app.get("/api/v2/voice/profile")
+def get_voice_profile(user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Get voice profile — personalized"""
+    ob = get_user_onboarding(user_id)
+
+    if ob:
+        voice_style = ob.get("voice_style", "Professional")
+        return DataEnvelopeResponse(
+            ok=True,
+            data={
+                "tone_markers": [voice_style, "Authentic", "Strategic"],
+                "boundaries": ob.get("integrity_boundaries", {}).get("values_protect", []),
+                "examples": [],
+                "consistency_score": 0,
+                "consistency_trend": "new",
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "tone_markers": [],
+            "boundaries": [],
+            "examples": [],
+            "consistency_score": 0,
+            "consistency_trend": "new",
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+# ============================================================================
+# Draft Endpoints
+# ============================================================================
+
+@app.post("/api/v2/drafts/generate")
+def generate_draft(data: Optional[Dict[str, Any]] = None, user_id: str = Depends(get_current_user)) -> DataEnvelopeResponse:
+    """Generate a draft — personalized"""
+    ob = get_user_onboarding(user_id)
+
+    if ob:
+        positioning = ob.get("positioning_target", "your expertise")
+        topics = ob.get("content_territories", ob.get("core_ideas", []))
+        first_topic = topics[0] if topics else positioning
+        core_ideas = ob.get("core_ideas", [])
+        claims_text = "\n\n".join([f"- {c}" for c in core_ideas[:3]]) if core_ideas else ""
+
+        content = f"""Here's a draft focused on {first_topic} to reinforce your positioning in {positioning}.
+
+Your key messages to reinforce:
+{claims_text}
+
+[This is a structural draft. Connect your personal experience and insights to these core ideas to make it authentic and compelling.]"""
+    else:
+        content = "Complete your brand setup to generate personalized drafts."
+
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "draft_id": str(uuid4()),
+            "type": "article",
+            "title": f"Draft: {ob.get('positioning_target', 'Your Topic') if ob else 'Set up your brand'}",
+            "content": content,
+            "territories_covered": ob.get("content_territories", [])[:3] if ob else [],
+            "tone_alignment": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+@app.post("/api/v2/drafts/validate")
+def validate_draft(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
+    """Validate a draft"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "is_valid": True,
+            "tone_alignment_score": 0,
+            "brief_alignment_score": 0,
+            "territory_coverage_score": 0,
+            "issues": [],
+            "suggestions": ["Continue building your content library"],
         },
     )
 
