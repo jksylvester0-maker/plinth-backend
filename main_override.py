@@ -6,6 +6,8 @@ Single-file implementation with SQLite, JWT, and mock data
 import os
 import sqlite3
 import json
+import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from uuid import uuid4
@@ -14,7 +16,6 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 import uvicorn
 
 
@@ -70,13 +71,19 @@ def get_db():
 # Password & JWT Utilities
 # ============================================================================
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    """Hash password with SHA-256 + random salt"""
+    salt = secrets.token_hex(16)
+    h = hashlib.sha256((salt + password).encode()).hexdigest()
+    return f"{salt}${h}"
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    """Verify password against stored hash"""
+    try:
+        salt, h = hashed.split("$", 1)
+        return hashlib.sha256((salt + plain).encode()).hexdigest() == h
+    except (ValueError, AttributeError):
+        return False
 
 def create_tokens(user_id: str) -> Dict[str, str]:
     """Create access and refresh tokens"""

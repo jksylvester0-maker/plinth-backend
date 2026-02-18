@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 WORKDIR /app
 
-# Install dependencies
-RUN pip install --no-cache-dir fastapi uvicorn python-jose[cryptography] passlib[bcrypt] python-dotenv
+# Install dependencies (no passlib/bcrypt needed)
+RUN pip install --no-cache-dir fastapi uvicorn python-jose[cryptography] python-dotenv
 
 # Copy the single-file backend
 COPY main_override.py /app/main.py
