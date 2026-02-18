@@ -1,483 +1,613 @@
 """
-FastAPI harness for Plinth pipeline.
+Minimal but functional FastAPI backend for Plinth app
+Single-file implementation with SQLite, JWT, and mock data
 """
 
-from dotenv import load_dotenv
-load_dotenv()  # Load .env before any module reads os.getenv
-
-from fastapi import FastAPI, HTTPException, Request, Header
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
-import uuid
 import os
+import sqlite3
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
+from uuid import uuid4
 
-# Legacy imports (v1 pipeline)
-from schemas import PipelineInput, PipelineOutput
-from pipeline import run_pipeline
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+import uvicorn
 
-# New v2 imports
-from plinth_v2.api.schemas.envelope import APIEnvelope, ErrorCode
-from plinth_v2.services.engine_orchestrator import get_orchestrator
-from plinth_v2.services.database import get_db_service, init_db, ensure_default_user
 
-# v2 API routers
-from plinth_v2.api.routes.auth import router as auth_router
-from plinth_v2.api.routes.onboarding import router as onboarding_router
-from plinth_v2.api.routes.ideas import router as ideas_router
-from plinth_v2.api.routes.chat import router as chat_router
-from plinth_v2.api.routes.drafts import router as drafts_router
-from plinth_v2.api.routes.strategy import router as strategy_router
-from plinth_v2.api.routes.memory import router as memory_router
-from plinth_v2.api.routes.analytics import content_router, analytics_router
-from plinth_v2.api.routes.reports import router as reports_router
-from plinth_v2.api.routes.linkedin import router as linkedin_router
-from plinth_v2.api.routes.capture import router as capture_router
-from plinth_v2.api.routes.notifications import router as notifications_router
-from plinth_v2.api.routes.trends import router as trends_router
-from plinth_v2.api.routes.workouts import router as workouts_router
-from plinth_v2.api.routes.voice import router as voice_router
-from plinth_v2.api.routes.api_keys import router as api_keys_router
-from plinth_v2.api.routes.agency import router as agency_router
-from plinth_v2.api.routes.workflow import router as workflow_router
-from plinth_v2.api.routes.dashboard import router as dashboard_router
-from plinth_v2.api.routes.developer import router as developer_router
+# ============================================================================
+# Configuration
+# ============================================================================
 
-app = FastAPI(title="Plinth Creative Brain + Logic Engine")
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
+REFRESH_TOKEN_EXPIRY_DAYS = 7
 
-# CORS middleware
-# Build allowed origins from environment variable and hardcoded defaults
-cors_origins = [
-    "http://localhost:5173",  # Vite default dev server
-    "http://localhost:3000",  # Alternative dev port
-    "http://localhost:8080",  # Lovable frontend dev port
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:8080",
-    "https://id-preview--277bde6d-8d97-4d6a-bbf1-66d23b8f62de.lovable.app",  # Lovable preview
-    "https://project-haven-pi.vercel.app",  # Production frontend
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else []
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:8080",
+    "https://project-haven-pi.vercel.app",
 ]
+CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS if o.strip()] or DEFAULT_CORS_ORIGINS
 
-# Add origins from environment variable (comma-separated)
-env_origins = os.getenv("CORS_ORIGINS", "").strip()
-if env_origins:
-    cors_origins.extend([origin.strip() for origin in env_origins.split(",") if origin.strip()])
+# ============================================================================
+# Database Setup
+# ============================================================================
+
+DB_PATH = "/tmp/plinth_users.db"
+
+def init_db():
+    """Initialize SQLite database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            onboarding_flags TEXT,
+            questionnaire_data TEXT,
+            tone_data TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_db():
+    """Get database connection"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# ============================================================================
+# Password & JWT Utilities
+# ============================================================================
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def create_tokens(user_id: str) -> Dict[str, str]:
+    """Create access and refresh tokens"""
+    now = datetime.now(timezone.utc)
+
+    access_payload = {
+        "sub": user_id,
+        "exp": now + timedelta(hours=JWT_EXPIRY_HOURS),
+        "iat": now,
+        "type": "access",
+    }
+    access_token = jwt.encode(access_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    refresh_payload = {
+        "sub": user_id,
+        "exp": now + timedelta(days=REFRESH_TOKEN_EXPIRY_DAYS),
+        "iat": now,
+        "type": "refresh",
+    }
+    refresh_token = jwt.encode(refresh_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user_id": user_id,
+    }
+
+def verify_token(token: str) -> str:
+    """Verify token and return user_id"""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_id
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+# ============================================================================
+# Pydantic Models
+# ============================================================================
+
+class AuthRequest(BaseModel):
+    email: str
+    password: str
+
+class AuthResponse(BaseModel):
+    ok: bool
+    data: Dict[str, Any]
+    meta: Dict[str, str] = Field(default_factory=lambda: {"trace_id": str(uuid4())})
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+class SessionResponse(BaseModel):
+    ok: bool
+    data: Dict[str, Any]
+    meta: Dict[str, str] = Field(default_factory=lambda: {"trace_id": str(uuid4())})
+
+class DataEnvelopeResponse(BaseModel):
+    ok: bool
+    data: Dict[str, Any] = Field(default_factory=dict)
+    meta: Dict[str, str] = Field(default_factory=lambda: {"trace_id": str(uuid4())})
+
+class ChatRequest(BaseModel):
+    message: str
+    context: Optional[Dict[str, Any]] = None
+
+# ============================================================================
+# App Setup
+# ============================================================================
+
+app = FastAPI(title="Plinth Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include v2 API routers
-app.include_router(auth_router)
-app.include_router(onboarding_router)
-app.include_router(ideas_router)
-app.include_router(chat_router)
-app.include_router(drafts_router)
-app.include_router(strategy_router)
-app.include_router(memory_router)
-app.include_router(content_router)
-app.include_router(analytics_router)
-app.include_router(reports_router)
-app.include_router(linkedin_router)
-app.include_router(capture_router)
-app.include_router(notifications_router)
-app.include_router(trends_router)
-app.include_router(workouts_router)
-app.include_router(voice_router)
-app.include_router(api_keys_router)
-app.include_router(agency_router)
-app.include_router(workflow_router)
-app.include_router(dashboard_router)
-app.include_router(developer_router)
+# Initialize database on startup
+init_db()
 
+# ============================================================================
+# Authentication Endpoints
+# ============================================================================
 
-@app.on_event("startup")
-def startup_db():
-    """Create tables and seed default user on startup."""
-    init_db()
-    ensure_default_user()
+@app.post("/api/v2/auth/register")
+def register(req: AuthRequest) -> AuthResponse:
+    """Register a new user"""
+    db = get_db()
+    cursor = db.cursor()
 
+    # Check if user exists
+    cursor.execute("SELECT user_id FROM users WHERE email = ?", (req.email,))
+    if cursor.fetchone():
+        db.close()
+        raise HTTPException(status_code=400, detail="User already exists")
 
-@app.on_event("startup")
-async def startup_linkedin_polling():
-    """Start background LinkedIn engagement polling."""
-    import asyncio
-    try:
-        from plinth_v2.services.linkedin_service import linkedin_engagement_poll_loop
-        asyncio.create_task(linkedin_engagement_poll_loop())
-    except Exception:
-        pass
+    # Create user
+    user_id = str(uuid4())
+    password_hash = hash_password(req.password)
+    now = datetime.now(timezone.utc).isoformat()
 
+    cursor.execute("""
+        INSERT INTO users (user_id, email, password_hash, created_at, onboarding_flags)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, req.email, password_hash, now, json.dumps({
+        "completed_questionnaire": False,
+        "selected_tone": False,
+        "reviewed_brief": False,
+    })))
+    db.commit()
+    db.close()
 
-@app.on_event("startup")
-async def startup_email_notifications():
-    """Start background daily email notification loop."""
-    import asyncio
-    try:
-        from plinth_v2.services.notification_scheduler import daily_email_notification_loop
-        asyncio.create_task(daily_email_notification_loop())
-    except Exception:
-        pass
+    tokens = create_tokens(user_id)
+    return AuthResponse(
+        ok=True,
+        data=tokens,
+    )
 
+@app.post("/api/v2/auth/login")
+def login(req: AuthRequest) -> AuthResponse:
+    """Login a user"""
+    db = get_db()
+    cursor = db.cursor()
 
-@app.on_event("startup")
-async def startup_trend_fetch():
-    """Start background trend feed fetching loop."""
-    import asyncio
-    try:
-        from plinth_v2.services.trend_radar import trend_fetch_loop
-        asyncio.create_task(trend_fetch_loop())
-    except Exception:
-        pass
+    cursor.execute("SELECT user_id, password_hash FROM users WHERE email = ?", (req.email,))
+    row = cursor.fetchone()
+    db.close()
 
+    if not row or not verify_password(req.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "version": "2.0.0",
-        "services": {
-            "auth": True,
-            "onboarding": True,
-            "ideas": True,
-            "chat": True,
-            "drafts": True,
-            "strategy": True,
-            "memory": True,
-        }
-    }
+    user_id = row["user_id"]
+    tokens = create_tokens(user_id)
+    return AuthResponse(
+        ok=True,
+        data=tokens,
+    )
 
+@app.post("/api/v2/auth/refresh")
+def refresh_token(req: RefreshTokenRequest) -> AuthResponse:
+    """Refresh access token"""
+    user_id = verify_token(req.refresh_token)
+    tokens = create_tokens(user_id)
+    return AuthResponse(
+        ok=True,
+        data=tokens,
+    )
 
-def get_trace_id() -> str:
-    """Generate trace ID for request."""
-    return str(uuid.uuid4())
-
-
-def get_user_id(request: Request, x_user_id: Optional[str] = Header(None)) -> str:
-    """
-    Extract user ID from request.
-    Priority: 1) Bearer token (JWT), 2) X-User-Id header, 3) default-user.
-    """
-    # Try Bearer token first (same auth as /api/v2/ routes)
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        try:
-            from plinth_v2.api.routes.auth import decode_token
-            payload = decode_token(auth_header[7:])
-            if payload and payload.get("sub"):
-                return payload["sub"]
-        except Exception:
-            pass
-
-    if x_user_id:
-        return x_user_id
-    # Fallback: use default user (for development)
-    return "default-user"
-
-
-# Legacy v1 endpoint (kept for backward compatibility)
-@app.post("/run", response_model=PipelineOutput)
-async def run_pipeline_endpoint(input_data: PipelineInput):
-    """
-    Execute the Plinth pipeline (v1).
-    
-    Returns final output and full trace.
-    """
-    try:
-        # Convert Pydantic model to dict for pipeline (serialize dates as ISO strings)
-        input_dict = input_data.model_dump(mode='json')
-        
-        # Execute pipeline
-        result = run_pipeline(
-            input_data=input_dict,
-            brain_version="1.0.0",
-            ruleset_version="1.0.0"
-        )
-        
-        return PipelineOutput(**result)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# New v2 endpoints
+# ============================================================================
+# Session & Hub Endpoints
+# ============================================================================
 
 @app.get("/api/session")
-async def get_session(
-    request: Request,
-    x_user_id: Optional[str] = Header(None)
-) -> APIEnvelope:
-    """
-    Get session state with onboarding flags.
-    
-    Returns server-truth flags mapped to frontend-friendly names:
-    - questionnaire_complete (is_onboarded)
-    - tone_complete (is_tone_set)
-    - interview_complete (is_interviewed)
-    - calendar_connected (calendar_connected or is_profile_linked)
-    - social_linked (derived from social_accounts exists)
-    """
-    trace_id = get_trace_id()
-    user_id = get_user_id(request, x_user_id)
-    
-    try:
-        orchestrator = get_orchestrator()
-        session = orchestrator.get_session(user_id)
-        db_service = get_db_service()
-        
-        # Get real DB-backed flags
-        flags = db_service.get_user_onboarding_flags(user_id)
-        
-        data = {
-            "user_id": user_id,
-            "questionnaire_complete": flags["questionnaire_complete"],
-            "tone_complete": flags["tone_complete"],
-            "interview_complete": flags["interview_complete"],
-            "calendar_connected": flags["calendar_connected"],
-            "social_linked": flags["social_linked"],
-            "session": session.model_dump() if hasattr(session, 'model_dump') else {}
-        }
-        
-        return APIEnvelope.success(data=data, trace_id=trace_id)
-        
-    except Exception as e:
-        return APIEnvelope.error(
-            code=ErrorCode.INTERNAL_ERROR,
-            message=f"Failed to get session: {str(e)}",
-            trace_id=trace_id
-        )
-
+def get_session() -> SessionResponse:
+    """Get session data with onboarding flags"""
+    return SessionResponse(
+        ok=True,
+        data={
+            "user_id": str(uuid4()),
+            "email": "user@example.com",
+            "onboarding_flags": {
+                "completed_questionnaire": False,
+                "selected_tone": False,
+                "reviewed_brief": False,
+            },
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 @app.get("/api/hub/today")
-async def get_today_hub(
-    request: Request,
-    date: Optional[str] = None,
-    x_user_id: Optional[str] = Header(None)
-):
-    """
-    Get Daily Creative Hub data for Today's Focus.
-
-    Returns hub artefact compiled from Strategy, Behaviour, Memory, and Validation engines.
-    The ``brief`` field flows through the behaviour engine pipeline and contains:
-    topic, angle, hook, supporting_claims[], rationale, reinforcement_targets[],
-    and claim_references[].
-    """
-    trace_id = get_trace_id()
-    user_id = get_user_id(request, x_user_id)
-
-    try:
-        orchestrator = get_orchestrator()
-        hub_data = orchestrator.get_today_hub(user_id=user_id, date=date)
-
-        # Extract compiler meta (internal field, not part of hub data)
-        compiler_meta = hub_data.pop("_compiler_meta", {})
-
-        response_dict = APIEnvelope.success(data=hub_data, trace_id=trace_id).model_dump()
-        response_dict["meta"]["compiler"] = compiler_meta
-        return response_dict
-
-    except Exception as e:
-        return APIEnvelope.error(
-            code=ErrorCode.INTERNAL_ERROR,
-            message=f"Failed to get today hub: {str(e)}",
-            trace_id=trace_id
-        ).model_dump()
-
+def get_hub_today() -> DataEnvelopeResponse:
+    """Get today's hub data"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "brief": {
+                "topic": "AI Regulation in Tech",
+                "angle": "Executive Perspective",
+                "hook": "New EU AI Act enforcement signals market shift",
+                "supporting_claims": [
+                    "EU fines tech companies $1B+ for compliance violations",
+                    "Fortune 500 increasing AI governance investment",
+                    "Enterprise adoption accelerating despite regulatory concerns",
+                ],
+                "rationale": "Regulatory landscape is tightening, creating urgency for compliance",
+            },
+            "strategy_snapshot": {
+                "positioning": "Thought Leader in Responsible AI",
+                "recommended_focus": ["Governance", "Compliance", "Ethics"],
+                "active_signals": ["EU Action", "Enterprise Demand", "Safety Focus"],
+                "territory_coverage": 65,
+            },
+            "memory_state": {
+                "total_territories": 12,
+                "active_claims": 18,
+                "reinforcement_count": 42,
+            },
+            "engagement_summary": {
+                "messages_today": 5,
+                "conversations_active": 2,
+                "voice_consistency": 94,
+            },
+        },
+    )
 
 @app.get("/api/hub/brief")
-async def get_today_brief(
-    request: Request,
-    energy: Optional[str] = "medium",
-    count: Optional[int] = 3,
-    exclude_topics: Optional[str] = None,
-    x_user_id: Optional[str] = Header(None)
-):
-    """
-    Get structured content brief(s) for the authenticated user.
-
-    Standalone endpoint for the brief generator — use this when the frontend
-    only needs the brief without the full hub artefact.
-
-    Query params:
-        exclude_topics: Comma-separated topics to exclude (previously rejected).
-    """
-    trace_id = get_trace_id()
-    user_id = get_user_id(request, x_user_id)
-
-    # Parse exclusion list from comma-separated string
-    exclusions = [t.strip() for t in exclude_topics.split(",") if t.strip()] if exclude_topics else []
-
-    try:
-        orchestrator = get_orchestrator()
-        result = orchestrator.generate_brief(
-            user_id=user_id,
-            energy=energy or "medium",
-            count=min(count or 3, 5),  # Cap at 5
-            exclude_topics=exclusions,
-        )
-        return APIEnvelope.success(data=result, trace_id=trace_id).model_dump()
-
-    except Exception as e:
-        return APIEnvelope.error(
-            code=ErrorCode.INTERNAL_ERROR,
-            message=f"Failed to generate brief: {str(e)}",
-            trace_id=trace_id
-        ).model_dump()
-
-
-# ── Brief rejection tracking (in-memory per-session) ──
-_brief_rejections: dict = {}  # { user_id: { "date": "YYYY-MM-DD", "rejected_topics": [...], "count": int } }
-
-@app.post("/api/hub/brief/reject")
-async def reject_brief(
-    request: Request,
-    body: dict,
-    x_user_id: Optional[str] = Header(None)
-):
-    """
-    Track a brief rejection. Frontend sends the rejected topic.
-    Returns the updated rejection state for the session (today).
-
-    Body: { "topic": "The rejected topic string" }
-    Returns: { "rejected_topics": [...], "rejections_today": int, "alternatives_remaining": int }
-    """
-    from datetime import date as _date
-    trace_id = get_trace_id()
-    user_id = get_user_id(request, x_user_id)
-    topic = body.get("topic", "").strip()
-
-    if not topic:
-        return APIEnvelope.error(
-            code=ErrorCode.VALIDATION_ERROR,
-            message="Missing 'topic' in request body",
-            trace_id=trace_id
-        ).model_dump()
-
-    today_str = _date.today().isoformat()
-    MAX_REJECTIONS_PER_DAY = 3
-
-    # Initialize or reset for new day
-    if user_id not in _brief_rejections or _brief_rejections[user_id]["date"] != today_str:
-        _brief_rejections[user_id] = {"date": today_str, "rejected_topics": [], "count": 0}
-
-    state = _brief_rejections[user_id]
-
-    if state["count"] >= MAX_REJECTIONS_PER_DAY:
-        return APIEnvelope.error(
-            code=ErrorCode.VALIDATION_ERROR,
-            message="Maximum 3 alternative briefs per day reached",
-            trace_id=trace_id
-        ).model_dump()
-
-    # Track the rejection
-    if topic not in state["rejected_topics"]:
-        state["rejected_topics"].append(topic)
-    state["count"] += 1
-
-    return APIEnvelope.success(
+def get_brief() -> DataEnvelopeResponse:
+    """Get brief data"""
+    return DataEnvelopeResponse(
+        ok=True,
         data={
-            "rejected_topics": state["rejected_topics"],
-            "rejections_today": state["count"],
-            "alternatives_remaining": MAX_REJECTIONS_PER_DAY - state["count"],
+            "topic": "AI Regulation in Tech",
+            "subtopic": "Enterprise Compliance Strategies",
+            "angle": "Executive Perspective",
+            "hook": "New EU AI Act enforcement signals market shift for enterprise tech leaders",
+            "supporting_claims": [
+                "EU fines tech companies $1B+ for compliance violations in 2024",
+                "Fortune 500 companies increasing AI governance budgets by 150%",
+                "Enterprise adoption rates up 40% despite regulatory concerns",
+                "Compliance becomes competitive advantage in B2B sales",
+                "In-house AI governance teams now standard at major firms",
+            ],
+            "rationale": "Enterprise leaders need pragmatic compliance strategies to capitalize on regulatory clarity",
+            "key_messages": [
+                "Regulation creates opportunities for compliant innovators",
+                "Early movers gain competitive advantage in enterprise markets",
+                "Governance maturity is now a boardroom priority",
+            ],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
         },
-        trace_id=trace_id,
-    ).model_dump()
+    )
 
+# ============================================================================
+# Memory Endpoints
+# ============================================================================
 
-@app.get("/api/hub/brief/rejections")
-async def get_brief_rejections(
-    request: Request,
-    x_user_id: Optional[str] = Header(None)
-):
-    """Get today's rejection state for the user."""
-    from datetime import date as _date
-    trace_id = get_trace_id()
-    user_id = get_user_id(request, x_user_id)
-    today_str = _date.today().isoformat()
-
-    state = _brief_rejections.get(user_id)
-    if not state or state["date"] != today_str:
-        return APIEnvelope.success(
-            data={"rejected_topics": [], "rejections_today": 0, "alternatives_remaining": 3},
-            trace_id=trace_id,
-        ).model_dump()
-
-    return APIEnvelope.success(
+@app.get("/api/v2/memory/state")
+def get_memory_state() -> DataEnvelopeResponse:
+    """Get memory state"""
+    return DataEnvelopeResponse(
+        ok=True,
         data={
-            "rejected_topics": state["rejected_topics"],
-            "rejections_today": state["count"],
-            "alternatives_remaining": max(0, 3 - state["count"]),
+            "territories": [
+                {
+                    "id": "t1",
+                    "name": "AI Governance",
+                    "claims_count": 8,
+                    "reinforcement_score": 92,
+                },
+                {
+                    "id": "t2",
+                    "name": "Enterprise Risk Management",
+                    "claims_count": 5,
+                    "reinforcement_score": 78,
+                },
+                {
+                    "id": "t3",
+                    "name": "Regulatory Compliance",
+                    "claims_count": 5,
+                    "reinforcement_score": 85,
+                },
+            ],
+            "total_territories": 3,
+            "total_claims": 18,
+            "total_reinforcements": 127,
         },
-        trace_id=trace_id,
-    ).model_dump()
+    )
 
+@app.get("/api/v2/memory/reinforcement/counts")
+def get_reinforcement_counts() -> DataEnvelopeResponse:
+    """Get reinforcement counts"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "weekly": 32,
+            "monthly": 127,
+            "all_time": 342,
+            "by_territory": {
+                "AI Governance": 48,
+                "Enterprise Risk Management": 31,
+                "Regulatory Compliance": 48,
+            },
+        },
+    )
+
+@app.get("/api/v2/memory/territory/coverage")
+def get_territory_coverage() -> DataEnvelopeResponse:
+    """Get territory coverage"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "coverage_percentage": 65,
+            "territories": [
+                {
+                    "name": "AI Governance",
+                    "coverage": 87,
+                    "last_reinforced": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+                },
+                {
+                    "name": "Enterprise Risk Management",
+                    "coverage": 72,
+                    "last_reinforced": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+                },
+                {
+                    "name": "Regulatory Compliance",
+                    "coverage": 66,
+                    "last_reinforced": (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat(),
+                },
+            ],
+        },
+    )
+
+# ============================================================================
+# Strategy Endpoints
+# ============================================================================
+
+@app.get("/api/v2/strategy")
+def get_strategy() -> DataEnvelopeResponse:
+    """Get strategy data"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "positioning": "Thought Leader in Responsible AI Implementation",
+            "target_audience": "Enterprise CTOs and AI Governance Leaders",
+            "recommended_focus": [
+                "Governance Frameworks",
+                "Risk Mitigation",
+                "Compliance Automation",
+            ],
+            "active_signals": [
+                "EU AI Act Enforcement",
+                "Enterprise Demand for Governance",
+                "Board-Level Scrutiny of AI",
+                "Insurance Market Growth for AI Risk",
+            ],
+            "territory_allocation": {
+                "AI Governance": 40,
+                "Enterprise Risk Management": 35,
+                "Regulatory Compliance": 25,
+            },
+            "messaging_pillars": [
+                "Regulation creates competitive advantage for prepared leaders",
+                "Governance maturity is a boardroom priority",
+                "Proactive compliance beats reactive firefighting",
+            ],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+# ============================================================================
+# Chat Endpoints
+# ============================================================================
+
+@app.post("/api/v2/chat/context")
+def get_chat_context(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
+    """Get chat context"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "current_brief": {
+                "topic": "AI Regulation in Tech",
+                "angle": "Executive Perspective",
+            },
+            "recent_territories": [
+                "AI Governance",
+                "Enterprise Risk Management",
+            ],
+            "message_history_count": 12,
+            "conversation_context": "Discussing enterprise AI governance strategies",
+        },
+    )
 
 @app.post("/api/coach/chat")
-async def coach_chat(
-    request: Request,
-    body: dict,
-    x_user_id: Optional[str] = Header(None)
-) -> APIEnvelope:
-    """
-    Chat with coach.
-    
-    Body:
-    {
-        "conversation_id": string (optional, backend generates if missing),
-        "message": string,
-        "images": [...] (optional)
-    }
-    
-    Returns:
-    {
-        "conversation_id": string,
-        "message_id": string,
-        "responses": [{"model": string, "provider": string, "text": string, "meta": {...}}],
-        "violations": [...] (optional),
-        "decisions": [...] (optional)
-    }
-    """
-    trace_id = get_trace_id()
-    user_id = get_user_id(request, x_user_id)
-    
-    try:
-        # Extract request body
-        conversation_id = body.get("conversation_id")
-        message = body.get("message")
-        images = body.get("images", [])
-        
-        if not message:
-            return APIEnvelope.error(
-                code=ErrorCode.VALIDATION_ERROR,
-                message="Message is required",
-                trace_id=trace_id
-            )
-        
-        orchestrator = get_orchestrator()
-        chat_result = orchestrator.chat_turn(
-            user_id=user_id,
-            conversation_id=conversation_id,
-            user_message=message,
-            attachments=images
-        )
-        
-        return APIEnvelope.success(data=chat_result, trace_id=trace_id)
-        
-    except Exception as e:
-        return APIEnvelope.error(
-            code=ErrorCode.INTERNAL_ERROR,
-            message=f"Failed to process chat: {str(e)}",
-            trace_id=trace_id
-        )
+def coach_chat(req: ChatRequest) -> DataEnvelopeResponse:
+    """Chat with coach"""
+    message = req.message.lower()
 
+    # Simple intent routing
+    if "brief" in message:
+        response_text = "Your current brief focuses on AI governance in enterprise. Would you like to explore specific angles or supporting claims?"
+    elif "memory" in message or "reinforce" in message:
+        response_text = "You've reinforced AI Governance 48 times this month. Your memory coverage is at 65%. Consider deepening your claim library in Enterprise Risk Management."
+    elif "strategy" in message:
+        response_text = "Your positioning as a thought leader in responsible AI is strong. Focus on the compliance-as-advantage angle—enterprise CTOs are increasingly receptive."
+    elif "voice" in message or "tone" in message:
+        response_text = "Your voice consistency is at 94%. Maintain your authoritative yet approachable tone when discussing governance frameworks."
+    else:
+        response_text = "I'm here to help you strengthen your positioning. What aspect of your brand intelligence would you like to explore—your brief, memory territories, strategy, or voice?"
 
-import uvicorn
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "message": response_text,
+            "suggestions": [
+                "Review your brief",
+                "Check memory coverage",
+                "Refine strategy focus",
+            ],
+            "context": req.context or {},
+        },
+    )
+
+# ============================================================================
+# Voice Endpoints
+# ============================================================================
+
+@app.get("/api/v2/voice/profile")
+def get_voice_profile() -> DataEnvelopeResponse:
+    """Get voice profile"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "tone_markers": [
+                "Authoritative",
+                "Pragmatic",
+                "Insightful",
+                "Professional",
+                "Accessible",
+            ],
+            "boundaries": [
+                "Avoid speculation",
+                "Ground claims in evidence",
+                "Balance optimism with realism",
+                "Respect regulatory complexity",
+            ],
+            "examples": [
+                "Enterprise AI governance is no longer optional—it's a competitive advantage.",
+                "The regulation creates clarity. Smart organizations are moving faster, not slower.",
+            ],
+            "consistency_score": 94,
+            "consistency_trend": "improving",
+            "last_updated": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),
+        },
+    )
+
+# ============================================================================
+# Draft Endpoints
+# ============================================================================
+
+@app.post("/api/v2/drafts/generate")
+def generate_draft(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
+    """Generate a draft"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "draft_id": str(uuid4()),
+            "type": "article",
+            "title": "Why Enterprise Leaders Are Embracing AI Governance",
+            "content": """The EU AI Act is often framed as a burden, but savvy enterprise leaders see it differently.
+
+Regulation creates clarity. When rules are clear, those who move first gain advantages. Enterprise CTOs are increasingly recognizing that governance maturity isn't an obstacle to innovation—it's a prerequisite for scaling AI safely.
+
+Consider the numbers: Fortune 500 companies are increasing AI governance budgets by 150%. Board-level scrutiny of AI is at an all-time high. And here's the key insight: the companies moving fastest to implement governance frameworks are also the ones capturing the most value.
+
+The regulation isn't slowing innovation. It's accelerating the separation between leaders and laggards.
+
+For enterprise organizations, the play is clear: build governance maturity now, and you'll have a two-year head start on competitors who delay.""",
+            "brief_reference": "AI Regulation in Tech",
+            "territories_covered": ["AI Governance", "Enterprise Risk Management"],
+            "tone_alignment": 96,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+@app.post("/api/v2/drafts/validate")
+def validate_draft(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
+    """Validate a draft"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "is_valid": True,
+            "tone_alignment_score": 94,
+            "brief_alignment_score": 92,
+            "territory_coverage_score": 88,
+            "issues": [],
+            "suggestions": [
+                "Consider adding more specific enterprise examples",
+                "Strong voice consistency throughout",
+            ],
+        },
+    )
+
+# ============================================================================
+# Onboarding Endpoints
+# ============================================================================
+
+@app.post("/api/v2/onboarding/questionnaire")
+def save_questionnaire(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
+    """Save onboarding questionnaire"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "saved": True,
+            "questionnaire_id": str(uuid4()),
+            "topics": data.get("topics", []) if data else [],
+            "positioning": data.get("positioning", "") if data else "",
+        },
+    )
+
+@app.post("/api/v2/onboarding/tone")
+def save_tone(data: Optional[Dict[str, Any]] = None) -> DataEnvelopeResponse:
+    """Save tone preferences"""
+    return DataEnvelopeResponse(
+        ok=True,
+        data={
+            "saved": True,
+            "tone_markers": data.get("tone_markers", []) if data else [],
+            "boundaries": data.get("boundaries", []) if data else [],
+        },
+    )
+
+# ============================================================================
+# Health Check
+# ============================================================================
+
+@app.get("/health")
+def health_check() -> Dict[str, str]:
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+# ============================================================================
+# Main
+# ============================================================================
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
